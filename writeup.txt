@@ -1,0 +1,133 @@
+# CSE258 Assignment 1 - Approach writeup
+
+This assignment is six prediction problems on Goodreads-style interaction data.
+Below is what each submitted model actually does, in plain language.
+
+---
+
+## Task 1 - Rating prediction `(user, item) --> rating`
+
+**Goal:** Guess how many stars a user would give a book (MSE; lower is better).
+
+**Idea:** Ratings are mostly "this user is generous" and "this book is popular,"
+plus a bit of taste match through bias fine-tuning. I start with several biased SVD models (Surprise):
+each one learns a number for every user, every item, and a small taste vector so
+that `global + user + item + dot(user, item)` approximates the rating. I train a
+few variants (different sizes / regularization) and average them across a few
+random seeds so one unlucky run does not dominate.
+
+On top of that I fit a LightGBM model that sees those SVD predictions plus
+simple stats (how many ratings a user/item has, mean rating, etc.). LightGBM is
+trained in the k-fold method: it never trains on the same rows the SVD was
+fit on for that fold, so it cannot just memorize SVD’s training error. The final
+answer is a blend of the SVD bag and LightGBM, with blend weights chosen on
+a held-out validation slice. Training drops rating-0 rows (the test set has none)
+and predictions are clipped to [1, 5], which matched the label support and cut public MSE.
+
+---
+
+## Task 2 - Pairwise interaction `(user, item1, item2) --> which`
+
+**Goal:** Given two books, pick which one the user actually interacted with
+(accuracy; higher is better).
+
+**Idea:** This is a ranking problem, not a star rating. I train Bayesian Personalized 
+Ranking (BPR): for each user it pushes the score of books they
+touched above books they did not. I run several BPR models with different sizes
+and random seeds and average their scores. At test time I compare
+`score(user, item1)` vs `score(user, item2)` and pick the higher one.
+
+Negatives during training are drawn with popularity weighting (popular books
+are more likely to be fake "non-interactions"). That made local validation less
+inflated than uniform random negatives. Extra LightGBM / ALS capacity was tried
+later; larger GPU ensembles hurt public score, so the submitted file stays the
+multi-seed BPR-only stack.
+
+---
+
+## Task 3 - Rating prediction with timestamp
+
+**Goal:** Same as Task 1, but the test row includes a time, so the model may use
+when the rating happened.
+
+**Idea:** The public test is NOT "predict the future after a cutoff." Most
+query times sit inside a user’s history. So I validate with a random-user
+holdout (hold out some of each user’s ratings) instead of a global time split.
+
+The base predictor is still SVD, but LightGBM gets time-aware features built
+around the query timestamp: nearby ratings from the same user (a few neighbors
+in time), short and longer time windows (±1 day / ±30 days), item age, calendar
+bits (hour / day-of-week), and so on. Those neighbor stats are computed with
+leave-one-out so a rating does not leak into its own features. LightGBM
+predicts a residual on top of SVD (again out-of-fold). Same as Task 1, rating-0
+rows are dropped and outputs are clipped to [1, 5]. Adding more neighbor /
+window features later looked better locally but worse on Gradescope, so the
+submitted model keeps the smaller bidirectional feature set.
+
+---
+
+## Task 4 - Pairwise interaction with timestamp
+
+**Goal:** Same as Task 2, but each pair has a timestamp.
+
+**Idea:** Same ranking setup as Task 2, with two important distribution fixes
+that moved public score more than "more factors" did:
+
+1. **Validation** uses a random within-user split (same reason as Task 3).
+2. **Negatives** are sampled proportional to **interaction count**, which better
+   matches how hard the Gradescope pairs look.
+
+I train a GPU BPR ensemble (several factor sizes) plus ALS, then a LightGBM
+pairwise model on score margins and time features (item age at the query time,
+recent popularity windows, user activity near that time, etc.). The final pick
+is a blend of those scores. Growing BPR capacity on the already-correct protocol
+only moved public accuracy a little; the big jump came from the protocol itself.
+
+---
+
+## Task 5 - Sequential "what comes next"
+
+**Goal:** Given two candidate next books for a user, pick the one that fits the
+sequence (accuracy; higher is better). Timestamps are not in the test file-only
+order in the history.
+
+**Idea:** Build training pairs from each user’s timeline (positive = a real next
+item). Fake negatives are drawn with interaction-frequency weighting, not
+uniformly from the catalog. Uniform negatives made local accuracy look ~0.92
+while public sat near baseline; matching the hard negative distribution fixed
+that gap.
+
+Features include short Markov / recent-window transition counts (did this
+user often go from last book A to book B?), plus BPR/ALS preference scores.
+LightGBM combines those into a pairwise decision. Extra sequence embeddings
+(item2vec) and bigger GPU BPR did not beat the submitted file on public, so they
+stay out of the blend.
+
+---
+
+## Task 6 - Time until next interaction `(user, item) --> delta`
+
+**Goal:** Predict how many seconds until this user’s next interaction
+(MAE; lower is better). The baseline always predicts that user’s median past
+gap.
+
+**Idea:** Every test user appears in training, and the test item is new to them.
+I turn each user’s history into successive gaps and predict the next one.
+Features describe the user’s gap pattern (median, recent gaps, upper percentiles,
+how often gaps are much longer than usual), simple calendar context from the
+last event, and light item statistics.
+
+A plain LightGBM trained for mean absolute error already beat the median
+baseline. Long waits dominate MAE, so the submitted model blends that L1
+model with a quantile model (weight 0.35) and adds those long-tail gap features. 
+That cut public MAE from about 13.16M to about 12.88M (baseline ≈ 13.56M).
+
+---
+
+## What mattered more than "bigger models"
+
+Across tasks, Gradescope moved most when the training/validation setup matched
+the hidden test: how negatives are sampled, whether time is treated as a global
+cutoff or a within-user query time, and (for Task 6) paying attention to long
+gaps. After that match, simply enlarging the same model family often stalled or
+hurt public score, so those larger runs were not submitted.
